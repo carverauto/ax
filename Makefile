@@ -42,13 +42,14 @@ install:
 	@echo "==> Installing ax CLI to $$(go env GOPATH)/bin..."
 	go install -trimpath -ldflags="-s -w" ./cmd/ax
 
-# Cross-compile ax-task-runner for Linux amd64 and build container image with Python, Antigravity, and git/curl
+# Build the task-runner container image with Python, Antigravity, and git/curl.
+# The Dockerfile compiles ax-task-runner for each requested platform, so
+# TASK_RUNNER_PLATFORMS=linux/amd64,linux/arm64 produces a multi-arch image
+# (that needs buildx and, for more than one platform, --push or a containerd image store).
+TASK_RUNNER_PLATFORMS ?= linux/amd64
 build-task-runner:
-	@echo "==> Cross-compiling ax-task-runner for linux/amd64..."
-	@mkdir -p bin/linux_amd64
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/linux_amd64/ax-task-runner ./cmd/ax-task-runner
-	@echo "==> Building container image $(TASK_RUNNER_REPO):latest using $(CONTAINER_CLI)..."
-	$(CONTAINER_CLI) build --platform linux/amd64 -t $(TASK_RUNNER_REPO):latest -f Dockerfile.task-runner .
+	@echo "==> Building container image $(TASK_RUNNER_REPO):latest for $(TASK_RUNNER_PLATFORMS) using $(CONTAINER_CLI)..."
+	$(CONTAINER_CLI) build --platform $(TASK_RUNNER_PLATFORMS) -t $(TASK_RUNNER_REPO):latest -f Dockerfile.task-runner .
 
 # Push task-runner container image to registry
 push-task-runner: build-task-runner
