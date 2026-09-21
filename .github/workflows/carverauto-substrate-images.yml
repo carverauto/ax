@@ -74,6 +74,9 @@ jobs:
             ./hack/run-tool.sh ko build --base-import-paths --ldflags="${LDFLAGS}" \
               --tags "${SUBSTRATE_REF::12}" "./cmd/$c" | tee -a images.txt
           done
+          # Upstream's counter demo: the smoke test for sandbox, suspend and resume.
+          ./hack/run-tool.sh ko build --base-import-paths --ldflags="${LDFLAGS}" \
+            --tags "${SUBSTRATE_REF::12}" ./demos/counter | tee -a images.txt
           { echo "### Substrate ${SUBSTRATE_REF::12} (version ${VERSION})"; sed 's/^/- `/; s/$/`/' images.txt; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify every image has both architectures
