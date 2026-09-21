@@ -46,7 +46,12 @@ jobs:
       # ax-task-runner uses the base image upstream sets in .ko.yaml
       # (alpine/git). The Python/Antigravity image from Dockerfile.task-runner
       # needs a Docker daemon and is not built here.
-      - uses: ko-build/setup-ko@v0.9
+      # Not ko-build/setup-ko: it unpacks into /usr/local/bin and the runner is not root.
+      - name: Install ko and crane
+        run: |
+          go install github.com/google/ko@v0.18.1
+          go install github.com/google/go-containerregistry/cmd/crane@v0.21.7
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Build and push images
         env:
@@ -61,10 +66,9 @@ jobs:
 
       - name: Verify every image has both architectures
         run: |
-          go install github.com/google/go-containerregistry/cmd/crane@latest
           for i in ax-controller ax-server ax-task-runner; do
             ref="$REGISTRY/$PROJECT/$i:${GITHUB_SHA::12}"
-            archs=$("$(go env GOPATH)/bin/crane" manifest "$ref" | jq -r '[.manifests[].platform.architecture] | unique | sort | join(",")')
-            echo "$ref -> $archs ($("$(go env GOPATH)/bin/crane" digest "$ref"))"
+            archs=$(crane manifest "$ref" | jq -r '[.manifests[].platform.architecture] | unique | sort | join(",")')
+            echo "$ref -> $archs ($(crane digest "$ref"))"
             case "$archs" in *amd64*arm64*) ;; *) echo "missing an architecture" >&2; exit 1;; esac
           done
