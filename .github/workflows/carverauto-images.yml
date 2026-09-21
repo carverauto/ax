@@ -64,6 +64,24 @@ jobs:
           echo "### Images" >> "$GITHUB_STEP_SUMMARY"
           sed 's/^/- `/; s/$/`/' images.txt >> "$GITHUB_STEP_SUMMARY"
 
+      # The controller always starts task containers with /usr/local/bin/ax-task-runner
+      # (docs/runner.md); ko puts the binary at /ko-app. Add a symlink layer.
+      # `crane append` on an index keeps only one platform, so append per platform
+      # and rebuild the index.
+      - name: Put ax-task-runner at the path the runner contract requires
+        run: |
+          repo="$REGISTRY/$PROJECT/ax-task-runner"; sha="${GITHUB_SHA::12}"
+          mkdir -p layer/usr/local/bin
+          ln -s /ko-app/ax-task-runner layer/usr/local/bin/ax-task-runner
+          tar -C layer --owner=0 --group=0 -cf layer.tar usr
+          members=()
+          for p in ${PLATFORMS//,/ }; do
+            crane append --platform "$p" -b "$repo:$sha" -f layer.tar -t "$repo:$sha-${p#*/}"
+            members+=(-m "$repo:$sha-${p#*/}")
+          done
+          crane index append "${members[@]}" -t "$repo:$sha"
+          crane tag "$repo:$sha" latest
+
       - name: Verify every image has both architectures
         run: |
           for i in ax-controller ax-server ax-task-runner; do
@@ -71,4 +89,9 @@ jobs:
             archs=$(crane manifest "$ref" | jq -r '[.manifests[].platform.architecture] | unique | sort | join(",")')
             echo "$ref -> $archs ($(crane digest "$ref"))"
             case "$archs" in *amd64*arm64*) ;; *) echo "missing an architecture" >&2; exit 1;; esac
+          done
+          for p in ${PLATFORMS//,/ }; do
+            crane export --platform "$p" "$REGISTRY/$PROJECT/ax-task-runner:${GITHUB_SHA::12}" - \
+              | tar -tf - | grep -qx "usr/local/bin/ax-task-runner" \
+              || { echo "$p: /usr/local/bin/ax-task-runner missing" >&2; exit 1; }
           done
