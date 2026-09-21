@@ -40,8 +40,11 @@ const (
 
 	gitSuccessLog = "git-success.log"
 	gitErrorLog   = "git-error.log"
-	gitRetries    = 5
-	gitRetryDelay = 2 * time.Second
+	// A new actor's egress path is not usable for the first several seconds after
+	// start (measured 12-24s on Substrate bb0effe: "Send failure: Broken pipe"), so
+	// the retry window has to outlast that, not just a transient network blip.
+	gitRetries    = 15
+	gitRetryDelay = 3 * time.Second
 
 	bootstrapScriptPath = "/usr/local/bin/antigravity_bootstrap.py"
 	// bootstrapAPIKeyEnv must be set for the Antigravity agent to run.
