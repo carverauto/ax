@@ -182,11 +182,24 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
+// handleReadyz answers two different questions.
+//
+// Plain /readyz is Substrate's container probe: "is the runner up?". Substrate takes
+// the golden snapshot as soon as it returns 200, and the golden actor has no egress
+// policy (the controller applies one to the task's actor only), so workspace setup
+// cannot be required here: a git fetch can never succeed before the snapshot.
+//
+// /readyz?check=workspace is the controller's poll: "is the workspace set up?".
+// Setup keeps retrying across the snapshot and completes once the actor has been
+// resumed as the task, where egress works.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	ready := s.workspaceReady
 	s.mu.RUnlock()
 
+	if r.URL.Query().Get("check") != "workspace" {
+		ready = true
+	}
 	if !ready {
 		http.Error(w, "workspace initializing", http.StatusServiceUnavailable)
 		return
