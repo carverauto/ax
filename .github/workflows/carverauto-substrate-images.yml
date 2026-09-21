@@ -48,22 +48,33 @@ jobs:
           password: ${{ secrets.HARBOR_ROBOT_SECRET }}
 
       # No Docker daemon on the ARC runners, and the runner is not root.
-      - name: Install ko and crane
+      - name: Install crane
         run: |
-          go install github.com/google/ko@v0.18.1
           go install github.com/google/go-containerregistry/cmd/crane@v0.21.7
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      # Platforms and base images come from Substrate's own .ko.yaml
-      # (linux/amd64 and linux/arm64).
+      # Build the way upstream's hack/install-ate.sh does: its pinned ko (run-tool.sh)
+      # and its version stamp. The version is not cosmetic. Nodes carry the label
+      # ate.dev/substrate-version=<version> and the controller schedules sandbox
+      # workers by its own compiled-in version, so an unstamped build ("dev")
+      # deploys fine and then never schedules a worker.
+      # Platforms and base images come from Substrate's .ko.yaml (amd64 + arm64).
       - name: Build and push images
         env:
           KO_DOCKER_REPO: ${{ env.REGISTRY }}/${{ env.PROJECT }}
         run: |
+          VERSION="${SUBSTRATE_REF::7}"
+          LDFLAGS="-X=github.com/agent-substrate/substrate/internal/version.Version=${VERSION}"
+          if command -v make >/dev/null; then
+            want="$(make -s ldflags | tr ' ' '\n' | grep 'internal/version\.Version=' | head -n1)"
+            [ "$want" = "$LDFLAGS" ] || { echo "version stamp mismatch: make says '$want', workflow uses '$LDFLAGS'" >&2; exit 1; }
+          fi
+          echo "stamping version ${VERSION}"
           for c in ateapi atecontroller atelet atenet podcertcontroller ateom-gvisor; do
-            ko build --base-import-paths --tags "${SUBSTRATE_REF::12}" "./cmd/$c" | tee -a images.txt
+            ./hack/run-tool.sh ko build --base-import-paths --ldflags="${LDFLAGS}" \
+              --tags "${SUBSTRATE_REF::12}" "./cmd/$c" | tee -a images.txt
           done
-          { echo "### Substrate ${SUBSTRATE_REF::12}"; sed 's/^/- `/; s/$/`/' images.txt; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### Substrate ${SUBSTRATE_REF::12} (version ${VERSION})"; sed 's/^/- `/; s/$/`/' images.txt; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify every image has both architectures
         run: |
