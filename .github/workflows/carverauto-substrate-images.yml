@@ -1,0 +1,75 @@
+# carverauto fork only: build Agent Substrate's images at a pinned commit and
+# push them to Harbor. Substrate publishes no images and has no release tags,
+# so a pinned commit is the unit of upgrade. Bump SUBSTRATE_REF deliberately.
+name: carverauto substrate images
+
+on:
+  push:
+    branches: [carverauto]
+    paths: [".github/workflows/carverauto-substrate-images.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.carverauto.dev
+  PROJECT: ax
+  SUBSTRATE_REPO: agent-substrate/substrate
+  SUBSTRATE_REF: bb0effed188e06a44e03862cb6ea993e58f86893
+
+jobs:
+  images:
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SUBSTRATE_REPO }}
+          ref: ${{ env.SUBSTRATE_REF }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Require Harbor robot credentials
+        env:
+          HARBOR_ROBOT_USERNAME: ${{ secrets.HARBOR_ROBOT_USERNAME }}
+          HARBOR_ROBOT_SECRET: ${{ secrets.HARBOR_ROBOT_SECRET }}
+        run: |
+          if [ -z "$HARBOR_ROBOT_USERNAME" ] || [ -z "$HARBOR_ROBOT_SECRET" ]; then
+            echo "Missing Harbor robot credentials. Set HARBOR_ROBOT_USERNAME and HARBOR_ROBOT_SECRET." >&2
+            exit 1
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_ROBOT_USERNAME }}
+          password: ${{ secrets.HARBOR_ROBOT_SECRET }}
+
+      # No Docker daemon on the ARC runners, and the runner is not root.
+      - name: Install ko and crane
+        run: |
+          go install github.com/google/ko@v0.18.1
+          go install github.com/google/go-containerregistry/cmd/crane@v0.21.7
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # Platforms and base images come from Substrate's own .ko.yaml
+      # (linux/amd64 and linux/arm64).
+      - name: Build and push images
+        env:
+          KO_DOCKER_REPO: ${{ env.REGISTRY }}/${{ env.PROJECT }}
+        run: |
+          for c in ateapi atecontroller atelet atenet podcertcontroller ateom-gvisor; do
+            ko build --base-import-paths --tags "${SUBSTRATE_REF::12}" "./cmd/$c" | tee -a images.txt
+          done
+          { echo "### Substrate ${SUBSTRATE_REF::12}"; sed 's/^/- `/; s/$/`/' images.txt; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify every image has both architectures
+        run: |
+          for c in ateapi atecontroller atelet atenet podcertcontroller ateom-gvisor; do
+            ref="$REGISTRY/$PROJECT/$c:${SUBSTRATE_REF::12}"
+            archs=$(crane manifest "$ref" | jq -r '[.manifests[].platform.architecture] | unique | sort | join(",")')
+            echo "$ref -> $archs ($(crane digest "$ref"))"
+            case "$archs" in *amd64*arm64*) ;; *) echo "missing an architecture" >&2; exit 1;; esac
+          done
