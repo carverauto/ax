@@ -37,7 +37,8 @@ import (
 
 // Supported providers and default models
 const (
-	ProviderGoogle = "google"
+	ProviderGoogle    = "google"
+	ProviderAnthropic = "anthropic"
 
 	DefaultModel             = "gemini-3.8-flash"
 	DefaultModelResourceName = "default-model"
@@ -49,6 +50,25 @@ const (
 // systemInstructionParam is the Parameters key holding a default system
 // instruction. It is not a generation parameter, so it is lifted out of the map.
 const systemInstructionParam = "systemInstruction"
+
+// baseURLParam is the Parameters key that overrides the provider endpoint, for
+// example to reach a self-hosted server that speaks the provider's API. Like
+// systemInstruction it is not a generation parameter, so it is lifted out of
+// the map and never sent to the model API.
+const baseURLParam = "baseURL"
+
+const (
+	anthropicDefaultBaseURL = "https://api.anthropic.com"
+	anthropicVersion        = "2023-06-01"
+	// The Messages API requires max_tokens on every request.
+	anthropicDefaultMaxTokens = 4096
+)
+
+// isClientParam reports whether a Parameters key configures the client rather
+// than the generation, and so must not be passed through to the model API.
+func isClientParam(k string) bool {
+	return k == systemInstructionParam || k == baseURLParam
+}
 
 // SecretKeyRef references a secret key for authentication.
 type SecretKeyRef = v1alpha1.SecretKeyRef
@@ -258,6 +278,13 @@ func NewClient(cfg Config, opts ...Option) *Client {
 
 	for _, opt := range opts {
 		opt(c)
+	}
+
+	// An explicit BaseURL (Config or WithBaseURL) wins over the parameter.
+	if c.cfg.BaseURL == "" {
+		if u, ok := c.cfg.Parameters[baseURLParam].(string); ok {
+			c.cfg.BaseURL = strings.TrimRight(u, "/")
+		}
 	}
 
 	if c.cfg.APIKey == "" {
@@ -487,6 +514,9 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	if provider == "" || provider == ProviderGoogle {
 		return c.generateGoogle(ctx, effectiveReq)
 	}
+	if provider == ProviderAnthropic {
+		return c.generateAnthropic(ctx, effectiveReq)
+	}
 
 	if c.cfg.DisableRemote {
 		return c.fallbackResponse(effectiveReq), nil
@@ -529,7 +559,7 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 	// Configured parameters go through as-is; per-request values override them.
 	genConfig := map[string]interface{}{}
 	for k, v := range c.cfg.Parameters {
-		if k != systemInstructionParam {
+		if !isClientParam(k) {
 			genConfig[k] = v
 		}
 	}
@@ -601,6 +631,114 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 			PromptTokens:     geminiResp.UsageMetadata.PromptTokenCount,
 			CompletionTokens: geminiResp.UsageMetadata.CandidatesTokenCount,
 			TotalTokens:      geminiResp.UsageMetadata.TotalTokenCount,
+		},
+	}, nil
+}
+
+// generateAnthropic communicates with the Anthropic Messages API, or with any
+// server that implements it (set baseURL to reach a self-hosted endpoint).
+func (c *Client) generateAnthropic(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	// A self-hosted endpoint may not need a key, so only the hosted API is
+	// treated as unreachable without one.
+	if c.cfg.DisableRemote || (c.cfg.APIKey == "" && c.cfg.BaseURL == "") {
+		return c.fallbackResponse(req), nil
+	}
+
+	baseURL := c.cfg.BaseURL
+	if baseURL == "" {
+		baseURL = anthropicDefaultBaseURL
+	}
+	endpoint := baseURL + "/v1/messages"
+
+	// Configured parameters go through as-is; per-request values override them.
+	payload := map[string]interface{}{}
+	for k, v := range c.cfg.Parameters {
+		if isClientParam(k) {
+			continue
+		}
+		// The Model docs use maxTokens; the API field is max_tokens.
+		if k == "maxTokens" {
+			k = "max_tokens"
+		}
+		payload[k] = v
+	}
+	payload["model"] = req.Model
+	payload["messages"] = []map[string]string{
+		{"role": "user", "content": req.Prompt},
+	}
+	if req.SystemInstruction != "" {
+		payload["system"] = req.SystemInstruction
+	}
+	if req.Temperature > 0 {
+		payload["temperature"] = req.Temperature
+	}
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
+	}
+	if _, ok := payload["max_tokens"]; !ok {
+		payload["max_tokens"] = anthropicDefaultMaxTokens
+	}
+
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("creating http request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("anthropic-version", anthropicVersion)
+	if c.cfg.APIKey != "" {
+		httpReq.Header.Set("x-api-key", c.cfg.APIKey)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return c.fallbackResponse(req), nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return c.fallbackResponse(req), nil
+		}
+		return nil, fmt.Errorf("anthropic api error %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var anthropicResp struct {
+		Model   string `json:"model"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+		return nil, fmt.Errorf("decoding anthropic response: %w", err)
+	}
+
+	// Only text blocks are the answer. Thinking and tool-use blocks are skipped.
+	var textBuilder strings.Builder
+	for _, block := range anthropicResp.Content {
+		if block.Type == "text" {
+			textBuilder.WriteString(block.Text)
+		}
+	}
+
+	return &GenerateResponse{
+		Model:   req.Model,
+		Content: textBuilder.String(),
+		Usage: UsageStats{
+			PromptTokens:     anthropicResp.Usage.InputTokens,
+			CompletionTokens: anthropicResp.Usage.OutputTokens,
+			TotalTokens:      anthropicResp.Usage.InputTokens + anthropicResp.Usage.OutputTokens,
 		},
 	}, nil
 }

@@ -295,3 +295,192 @@ func params(t *testing.T, m map[string]any) *structpb.Struct {
 	}
 	return s
 }
+
+func TestClient_AnthropicHTTP(t *testing.T) {
+	var got map[string]interface{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("expected path /v1/messages, got %s", r.URL.Path)
+		}
+		if h := r.Header.Get("x-api-key"); h != "test-anthropic-key" {
+			t.Errorf("expected x-api-key header, got %q", h)
+		}
+		if h := r.Header.Get("anthropic-version"); h == "" {
+			t.Errorf("expected anthropic-version header")
+		}
+		if r.URL.Query().Has("key") {
+			t.Errorf("api key must not be sent as a query parameter")
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decoding request body: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"type":  "message",
+			"model": "claude-opus-5",
+			"content": []map[string]string{
+				{"type": "thinking", "thinking": "internal reasoning that is not the answer"},
+				{"type": "text", "text": "Setup Go environment "},
+				{"type": "text", "text": "with Go 1.27"},
+			},
+			"usage": map[string]int{"input_tokens": 10, "output_tokens": 20},
+		})
+	}))
+	defer ts.Close()
+
+	cfg := model.Config{
+		Provider: model.ProviderAnthropic,
+		Model:    "claude-opus-5",
+		Parameters: map[string]any{
+			"maxTokens":         16000,
+			"top_p":             0.9,
+			"systemInstruction": "be brief",
+		},
+	}
+	c := model.NewClient(cfg, model.WithAPIKey("test-anthropic-key"), model.WithBaseURL(ts.URL))
+
+	resp, err := c.Generate(context.Background(), &model.GenerateRequest{Prompt: "plan it", Temperature: 0.5})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	if resp.Content != "Setup Go environment with Go 1.27" {
+		t.Errorf("expected only text blocks concatenated, got %q", resp.Content)
+	}
+	if resp.Usage.PromptTokens != 10 || resp.Usage.CompletionTokens != 20 || resp.Usage.TotalTokens != 30 {
+		t.Errorf("unexpected usage: %+v", resp.Usage)
+	}
+
+	if got["model"] != "claude-opus-5" {
+		t.Errorf("expected model in body, got %v", got["model"])
+	}
+	if got["max_tokens"] != float64(16000) {
+		t.Errorf("expected maxTokens parameter sent as max_tokens=16000, got %v", got["max_tokens"])
+	}
+	if _, ok := got["maxTokens"]; ok {
+		t.Errorf("maxTokens must be renamed, not sent as-is")
+	}
+	if got["top_p"] != 0.9 {
+		t.Errorf("expected other parameters passed through, got top_p=%v", got["top_p"])
+	}
+	if got["system"] != "be brief" {
+		t.Errorf("expected systemInstruction sent as system, got %v", got["system"])
+	}
+	if got["temperature"] != 0.5 {
+		t.Errorf("expected per-request temperature, got %v", got["temperature"])
+	}
+	for _, k := range []string{"systemInstruction", "baseURL"} {
+		if _, ok := got[k]; ok {
+			t.Errorf("client parameter %q must not be sent to the API", k)
+		}
+	}
+	msgs, _ := got["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("expected one message, got %v", got["messages"])
+	}
+	if m, _ := msgs[0].(map[string]interface{}); m["role"] != "user" || m["content"] != "plan it" {
+		t.Errorf("unexpected message: %v", msgs[0])
+	}
+}
+
+// A self-hosted server that speaks the Messages API is reached by setting
+// baseURL in the Model parameters, and needs no API key.
+func TestClient_AnthropicSelfHostedBaseURLParameter(t *testing.T) {
+	var got map[string]interface{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("expected path /v1/messages, got %s", r.URL.Path)
+		}
+		if h := r.Header.Get("x-api-key"); h != "" {
+			t.Errorf("expected no x-api-key header without a key, got %q", h)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"content": []map[string]string{{"type": "text", "text": "pong"}},
+			"usage":   map[string]int{"input_tokens": 3, "output_tokens": 1},
+		})
+	}))
+	defer ts.Close()
+
+	params, err := structpb.NewStruct(map[string]any{"baseURL": ts.URL + "/"})
+	if err != nil {
+		t.Fatalf("building parameters: %v", err)
+	}
+	crd := &v1alpha1.Model{
+		Metadata: &v1alpha1.ObjectMeta{Name: "self-hosted", Atespace: "default"},
+		Spec: &v1alpha1.ModelSpec{
+			Provider:   model.ProviderAnthropic,
+			Model:      "deepseek-v4-flash",
+			Parameters: params,
+			SecretKey:  &v1alpha1.SecretKeyRef{Name: "none", Key: "none"},
+		},
+	}
+	c := model.NewClient(model.ConfigFromCRD(crd), model.WithSecretResolver(func(string, string) (string, error) { return "", nil }))
+
+	resp, err := c.Generate(context.Background(), &model.GenerateRequest{Prompt: "ping"})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	if resp.Content != "pong" {
+		t.Errorf("expected a real response from the self-hosted endpoint, got %q", resp.Content)
+	}
+	if got["max_tokens"] != float64(4096) {
+		t.Errorf("expected default max_tokens, got %v", got["max_tokens"])
+	}
+	if _, ok := got["baseURL"]; ok {
+		t.Errorf("baseURL must not be sent to the API")
+	}
+}
+
+func TestClient_AnthropicAPIError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"type":"error","error":{"type":"invalid_request_error","message":"bad model"}}`, http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	c := model.NewClient(model.Config{Provider: model.ProviderAnthropic, Model: "nope"},
+		model.WithAPIKey("k"), model.WithBaseURL(ts.URL))
+	_, err := c.Generate(context.Background(), &model.GenerateRequest{Prompt: "x"})
+	if err == nil || !strings.Contains(err.Error(), "anthropic api error 400") {
+		t.Errorf("expected an anthropic api error, got %v", err)
+	}
+}
+
+func TestClient_UnsupportedProvider(t *testing.T) {
+	c := model.NewClient(model.Config{Provider: "nonesuch", Model: "m"}, model.WithAPIKey("k"))
+	_, err := c.Generate(context.Background(), &model.GenerateRequest{Prompt: "x"})
+	if err == nil || !strings.Contains(err.Error(), `unsupported provider "nonesuch"`) {
+		t.Errorf("expected unsupported provider error, got %v", err)
+	}
+}
+
+// The Gemini request must not carry client parameters either.
+func TestClient_GeminiDoesNotForwardClientParameters(t *testing.T) {
+	var got map[string]interface{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+	}))
+	defer ts.Close()
+
+	c := model.NewClient(model.Config{
+		Provider:   model.ProviderGoogle,
+		Model:      "gemini-3.8-flash",
+		Parameters: map[string]any{"baseURL": ts.URL, "temperature": 0.2},
+	}, model.WithAPIKey("k"))
+	if _, err := c.Generate(context.Background(), &model.GenerateRequest{Prompt: "x"}); err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	gc, _ := got["generationConfig"].(map[string]interface{})
+	if gc["temperature"] != 0.2 {
+		t.Errorf("expected temperature passed through, got %v", gc)
+	}
+	if _, ok := gc["baseURL"]; ok {
+		t.Errorf("baseURL must not be sent in generationConfig")
+	}
+}

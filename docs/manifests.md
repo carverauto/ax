@@ -133,6 +133,26 @@ For Anthropic models, store the key the same way and set `provider: anthropic`.
 kubectl create secret generic anthropic-api-secret --from-literal=ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+To use a self-hosted server that implements the Anthropic Messages API, such as
+vLLM, set `baseURL` in `parameters`. It is not sent to the model; it replaces
+`https://api.anthropic.com`. No API key is needed unless the server requires one.
+
+```yaml
+apiVersion: ax.io/v1alpha1
+kind: Model
+metadata:
+  name: local-model
+  atespace: default
+spec:
+  provider: anthropic
+  model: deepseek-v4-flash
+  parameters:
+    baseURL: http://vllm.llm.svc.cluster.local:8080
+    maxTokens: 4096
+```
+
+`baseURL` works the same way for `provider: google`.
+
 ```yaml
 apiVersion: ax.io/v1alpha1
 kind: Model
